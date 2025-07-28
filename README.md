@@ -40,3 +40,7 @@ A lightweight, high-performance webcam streaming  using a Node.js
 3.  Find your phone's local IP address.
 4.  Run `adb connect <your-phone-ip>:5555`.
 5.  Now, when you run `node server.js`, the automation will work over Wi-Fi.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
