@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Feed</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: black; }
+        video { width: 100vw; height: 100vh; object-fit: contain; }
+    </style>
+</head>
+<body>
+    <video id="remoteVideo" autoplay playsinline muted></video>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const remoteVideo = document.getElementById('remoteVideo');
+        let peerConnection;
+        remoteVideo.muted = true;
+        socket.on('offer', async (offer) => {
+            if (peerConnection) peerConnection.close();
+            peerConnection = new RTCPeerConnection();
+            peerConnection.ontrack = (event) => {
+                if (remoteVideo.srcObject !== event.streams[0]) {
+                    remoteVideo.srcObject = event.streams[0];
+                }
+                remoteVideo.play().catch(error => {
+                    console.warn("Autoplay was prevented:", error);
+                });
+            };
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            socket.emit('answer', answer);
+        });
+        socket.on('candidate', async (candidate) => {
+            if (peerConnection) {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+        });
+        socket.on('stream-stopped', () => {
+            if (peerConnection) peerConnection.close();
+            remoteVideo.srcObject = null;
+        });
+    </script>
+</body>
+</html>

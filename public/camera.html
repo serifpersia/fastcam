@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Control</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <meta name="theme-color" content="#1c1c1e">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        #wakeLockIndicator {
+            display: none;
+            width: 12px;
+            height: 12px;
+            background-color: #ff453a;
+            border-radius: 50%;
+            margin-left: 8px;
+            vertical-align: middle;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(255, 69, 58, 0.7);
+            }
+            70% {
+                box-shadow: 0 0 0 10px rgba(255, 69, 58, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(255, 69, 58, 0);
+            }
+        }
+    </style>
+</head>
+<body>
+    <video id="wakeLockVideo" muted loop playsinline style="position:absolute;left:-9999px;"></video>
+    <div id="loadingOverlay" style="display: none;"><p>Initializing...</p></div>
+    <h1>
+        Camera Control
+        <span id="wakeLockIndicator" title="Wake Lock Active"></span>
+    </h1>
+    <video id="localVideo" autoplay muted playsinline></video>
+    <div class="controls">
+        <div class="control-group" style="flex-direction: row; align-items: center; background-color: #2c2c2e; padding: 10px; border-radius: 8px;">
+            <input type="checkbox" id="disablePreview" style="width: auto; margin-right: 10px;">
+            <label for="disablePreview" style="margin-bottom: 0;">Disable local preview to save battery</label>
+        </div>
+        <div class="control-group">
+            <label for="cameraSelect">Camera</label>
+            <select id="cameraSelect" disabled></select>
+        </div>
+        <div class="control-group">
+            <label for="resolution">Resolution</label>
+            <select id="resolution" disabled></select>
+        </div>
+        <div class="control-group">
+            <label for="framerate">Frame Rate</label>
+            <select id="framerate" disabled></select>
+        </div>
+        <div class="control-group">
+            <label for="bitrate">Max Bitrate (kbps)</label>
+            <input type="number" id="bitrate" value="1000" min="100" max="8000" step="100" disabled>
+        </div>
+        <button id="streamButton" style="background-color: #30d158;" disabled>Start Streaming</button>
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const loadingText = loadingOverlay.querySelector('p');
+        const localVideo = document.getElementById('localVideo');
+        const streamButton = document.getElementById('streamButton');
+        const allControls = document.querySelectorAll('.controls select, .controls input, .controls button');
+        const wakeLockIndicator = document.getElementById('wakeLockIndicator');
+        const disablePreviewCheckbox = document.getElementById('disablePreview');
+        let localStream, peerConnection;
+        let isStreaming = false;
+        let capabilitiesMap = new Map();
+        const WakeLockManager = {
+            sentinel: null,
+            videoEl: document.getElementById('wakeLockVideo'),
+            silentVideoDataUri: "data:video/mp4;base64,AAAAHGZ0eXBNU05WAAACAE1TTlYAAAOUbW9vdgAAAGxtdmhkAAAAAM9ipeCz2Kl4AQAACAACAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAGGlvZHMAAAAAEwAACAEAAAEPAAABAAAAASQAAAB3dHJhawAAAFx0a2hkAAAAAM9ipeCz2Kl4AQAAAAEAAAAAAgAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAQAAAAAAGQBlZHRzAAAAHGVsc3QAAAAAAQAAAAIAAAAAAAEAAAAAZW1kZGEAAAAAAAQtaGRscgAAAAAAAAAAAE1lZGlhSGFuZGxlcgAAAAIBdG1pbnYAAAAgaGRscgAAAAAAAAAAVmlkZW9IYW5kbGVyAAAAAVh2bWhkAAAAAQAAAAAAAAAAAAAAAFRpY2s9Mjk5NyBUcyA9IDMwMDAgU2M9MQAAABRzdGJsAAAAZHN0c2QAAAAAAAAAAQAAACZtcDR2AAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABYAAAAAAAAAAAAAABAAABAAAAAAMgAAABYAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAYAAEAYAEAAAAAAAoA//8AAAAuZXNkcwAAAAADgIAEAAQAAAADgQAAAAAAGHN0dHMAAAAAAAAAAQAAAAEAAQAAAAAcc3RzcwAAAAAAAAABAAAAAQAAABRzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAYc3RzegAAAAAAAAAAAAAAAQAAAAwAAAAYc3RjbwAAAAAAAAABAAAAMAAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAC1pbHN0AAAAJql0b28AAAAcZGF0YQAAAAEAAAAATGF2ZjU3LjQxLjEwMA==",
+            async request() {
+                try {
+                    if ('wakeLock' in navigator) {
+                        this.sentinel = await navigator.wakeLock.request('screen');
+                        this.sentinel.addEventListener('release', () => { if (isStreaming) this.request(); });
+                    } else { throw new Error("Modern API not supported"); }
+                } catch (err) {
+                    this.videoEl.setAttribute('src', this.silentVideoDataUri);
+                    this.videoEl.play();
+                }
+                wakeLockIndicator.style.display = 'inline-block';
+            },
+            async release() {
+                if (this.sentinel) {
+                    await this.sentinel.release();
+                    this.sentinel = null;
+                }
+                this.videoEl.pause();
+                this.videoEl.removeAttribute('src');
+                wakeLockIndicator.style.display = 'none';
+            }
+        };
+        function setCodecPreference(sdp, codec) {
+            const sdpLines = sdp.split('\r\n');
+            const mLineIndex = sdpLines.findIndex(line => line.startsWith('m=video'));
+            if (mLineIndex === -1) return sdp;
+            let codecPayload;
+            const pattern = new RegExp(`a=rtpmap:(\\d+) ${codec}/\\d+`, 'i');
+            const rtpmapLine = sdpLines.find(line => line.match(pattern));
+            if (rtpmapLine) {
+                codecPayload = rtpmapLine.match(pattern)[1];
+            } else { return sdp; }
+            const mLineParts = sdpLines[mLineIndex].split(' ');
+            const otherPayloads = mLineParts.slice(3).filter(p => p !== codecPayload);
+            sdpLines[mLineIndex] = [mLineParts[0], mLineParts[1], mLineParts[2], codecPayload, ...otherPayloads].join(' ');
+            return sdpLines.join('\r\n');
+        }
+        const standardResolutions = [ { label: '320p', w: 426, h: 240 }, { label: '480p', w: 854, h: 480 }, { label: '720p', w: 1280, h: 720 }, { label: '1080p', w: 1920, h: 1080 }, { label: '1440p', w: 2560, h: 1440 }, { label: '4K (2160p)', w: 3840, h: 2160 }];
+        const standardFramerates = [120, 60, 30, 24];
+        async function probeAndBuildUI() {
+            loadingText.textContent = 'Scanning camera capabilities...';
+            let tempStream;
+            try {
+                const deviceId = document.getElementById('cameraSelect').value;
+                tempStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: deviceId ? { exact: deviceId } : undefined }});
+                const track = tempStream.getVideoTracks()[0];
+                capabilitiesMap.clear();
+                for (const res of standardResolutions) {
+                    for (const fps of standardFramerates) {
+                        const constraints = { width: { exact: res.w }, height: { exact: res.h }, frameRate: { exact: fps } };
+                        try {
+                            await track.applyConstraints(constraints);
+                            const resLabel = `${res.label} (${res.w}x${res.h})`;
+                            if (!capabilitiesMap.has(resLabel)) capabilitiesMap.set(resLabel, { w: res.w, h: res.h, framerates: [] });
+                            capabilitiesMap.get(resLabel).framerates.push(fps);
+                        } catch (e) {}
+                    }
+                }
+            } catch (err) {
+                throw new Error(`Could not access camera to probe. Error: ${err.message}`);
+            } finally {
+                tempStream?.getTracks().forEach(track => track.stop());
+            }
+            if (capabilitiesMap.size === 0) throw new Error("No compatible video modes found.");
+            populateResolutionDropdown();
+            updateFpsDropdown();
+        }
+        function populateResolutionDropdown() {
+            const resolutionSelect = document.getElementById('resolution');
+            resolutionSelect.innerHTML = '';
+            for (const label of capabilitiesMap.keys()) {
+                const option = document.createElement('option');
+                option.value = label;
+                option.text = label;
+                resolutionSelect.appendChild(option);
+            }
+        }
+        function updateFpsDropdown() {
+            const resolutionSelect = document.getElementById('resolution');
+            const framerateSelect = document.getElementById('framerate');
+            const selectedResLabel = resolutionSelect.value;
+            const validFramerates = capabilitiesMap.get(selectedResLabel)?.framerates || [];
+            framerateSelect.innerHTML = '';
+            validFramerates.forEach(fps => {
+                const option = document.createElement('option');
+                option.value = fps;
+                option.text = `${fps} fps`;
+                framerateSelect.appendChild(option);
+            });
+        }
+        async function setupCamera() {
+            if (localStream) localStream.getTracks().forEach(track => track.stop());
+            const resLabel = document.getElementById('resolution').value;
+            const resData = capabilitiesMap.get(resLabel);
+            if (!resData) return;
+            const constraints = { video: { deviceId: document.getElementById('cameraSelect').value ? { exact: document.getElementById('cameraSelect').value } : undefined, width: { exact: resData.w }, height: { exact: resData.h }, frameRate: { exact: parseInt(document.getElementById('framerate').value) } } };
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                if (disablePreviewCheckbox.checked) {
+                    localVideo.srcObject = null;
+                } else {
+                    localVideo.srcObject = localStream;
+                }
+                if (isStreaming) {
+                    await toggleStreaming();
+                    await toggleStreaming();
+                }
+            } catch (error) {
+                alert(`Failed to set camera mode: ${error.message}`);
+            }
+        }
+        const settingsToPersist = ['cameraSelect', 'resolution', 'framerate', 'bitrate', 'disablePreview'];
+        function saveSettings() {
+            const settings = {};
+            settingsToPersist.forEach(id => {
+                const el = document.getElementById(id);
+                settings[id] = (el.type === 'checkbox') ? el.checked : el.value;
+            });
+            localStorage.setItem('streamingAppSettings', JSON.stringify(settings));
+        }
+        function loadSettings() {
+            const savedSettings = JSON.parse(localStorage.getItem('streamingAppSettings'));
+            if (savedSettings) {
+                settingsToPersist.forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el && savedSettings[id] !== undefined) {
+                        if (el.type === 'checkbox') {
+                            el.checked = savedSettings[id];
+                        } else {
+                            el.value = savedSettings[id];
+                        }
+                    }
+                });
+            }
+        }
+        async function initialLoad() {
+            loadSettings();
+            try {
+                loadingOverlay.style.display = 'flex';
+                const cameraSelect = document.getElementById('cameraSelect');
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const videoDevices = devices.filter(d => d.kind === 'videoinput');
+                if (videoDevices.length === 0) {
+                    alert("No video cameras found on this device. Please check permissions and hardware.");
+                    loadingText.textContent = 'No Cameras Found.';
+                    return;
+                }
+                videoDevices.forEach(d => {
+                    const option = document.createElement('option');
+                    option.value = d.deviceId;
+                    option.text = d.label || `Camera ${cameraSelect.length + 1}`;
+                    cameraSelect.appendChild(option);
+                });
+                if (document.getElementById('cameraSelect').value && !videoDevices.some(d => d.deviceId === document.getElementById('cameraSelect').value)) {
+                    document.getElementById('cameraSelect').selectedIndex = 0;
+                }
+                await probeAndBuildUI();
+                await setupCamera();
+            } catch (err) {
+                alert(`Initialization failed: ${err.message}`);
+            } finally {
+                if (document.getElementById('cameraSelect').length > 0) {
+                    loadingOverlay.style.display = 'none';
+                    allControls.forEach(c => c.disabled = false);
+                }
+            }
+        }
+        async function toggleStreaming() {
+            if (isStreaming) {
+                await WakeLockManager.release();
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+                socket.emit('stream-stopped');
+                streamButton.textContent = 'Start Streaming';
+                streamButton.style.backgroundColor = '#30d158';
+                document.querySelectorAll('.controls select, .controls input').forEach(c => c.disabled = false);
+                isStreaming = false;
+            } else {
+                await WakeLockManager.request();
+                if (!localStream) {
+                    alert("Camera not ready.");
+                    return;
+                }
+                document.querySelectorAll('.controls select, .controls input').forEach(c => c.disabled = true);
+                streamButton.textContent = 'Stop Streaming';
+                streamButton.style.backgroundColor = '#ff453a';
+                peerConnection = new RTCPeerConnection();
+                localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+                peerConnection.onicecandidate = e => e.candidate && socket.emit('candidate', e.candidate);
+                let offer = await peerConnection.createOffer();
+                offer.sdp = setCodecPreference(offer.sdp, 'H264');
+                await peerConnection.setLocalDescription(offer);
+                updateBitrate();
+                socket.emit('post-offer', offer);
+                isStreaming = true;
+            }
+        }
+        function updateBitrate() {
+            if (!peerConnection) return;
+            const sender = peerConnection.getSenders().find(s => "video" === s.track.kind);
+            if (sender) {
+                const params = sender.getParameters();
+                params.encodings || (params.encodings = [{}]);
+                params.encodings[0].maxBitrate = 1e3 * parseInt(document.getElementById("bitrate").value);
+                sender.setParameters(params).then(() => {
+                    if (isStreaming) {
+                        streamButton.style.transition = 'none';
+                        streamButton.style.backgroundColor = '#0a84ff';
+                        setTimeout(() => {
+                            streamButton.style.transition = 'background-color 0.2s ease';
+                            streamButton.style.backgroundColor = '#ff453a';
+                        }, 150);
+                    }
+                }).catch(console.error);
+            }
+        }
+        disablePreviewCheckbox.addEventListener('change', () => {
+            saveSettings();
+            if (disablePreviewCheckbox.checked) {
+                localVideo.srcObject = null;
+                localVideo.style.display = 'none';
+            } else {
+                localVideo.srcObject = localStream;
+                localVideo.style.display = 'block';
+            }
+        });
+        document.getElementById('cameraSelect').addEventListener('change', async () => { saveSettings(); try { loadingOverlay.style.display = 'flex'; await probeAndBuildUI(); await setupCamera(); } catch(e) { alert(e.message); } finally { loadingOverlay.style.display = 'none'; } });
+        document.getElementById('resolution').addEventListener('change', () => { saveSettings(); updateFpsDropdown(); setupCamera(); });
+        document.getElementById('framerate').addEventListener('change', () => { saveSettings(); setupCamera(); });
+        document.getElementById('bitrate').addEventListener('change', () => { saveSettings(); updateBitrate(); });
+        streamButton.addEventListener('click', toggleStreaming);
+        socket.on('answer', async (answer) => peerConnection?.setRemoteDescription(new RTCSessionDescription(answer)));
+        socket.on('candidate', async (candidate) => peerConnection?.addIceCandidate(new RTCIceCandidate(candidate)));
+        window.addEventListener('load', initialLoad);
+    </script>
+</body>
+</html>
