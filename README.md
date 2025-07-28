@@ -30,7 +30,7 @@ A lightweight, high-performance webcam streaming  using a Node.js
     The server will attempt to automatically configure the ADB reverse tunnel.
 
 5.  **Open the pages:**
-    - **On your phone:** Open a web browser and navigate to `http://localhost:8080/camera`.
+    - **On your phone:**Open a web browser and navigate to `http://localhost:8080/camera`.
     - **In OBS/Browser/Video Player:**Use URL `http://localhost:8080/video`.
 
 ## Advanced Usage: Wireless ADB
