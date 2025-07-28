@@ -5,7 +5,7 @@ A lightweight, high-performance webcam streaming  using a Node.js
 ## Prerequisites
 
 1.  **Node.js:** Install Node.js.
-2.  **Android Platform Tools (ADB).
+2.  **Android Platform Tools (ADB):** ADB in PATH directory.
 3.  **Android Device:** With USB Debugging enabled.
 
 ## How to Use
